@@ -1,6 +1,8 @@
 import json
 import re
-from typing import Dict
+import time
+import argparse
+from typing import Dict, List, Optional
 
 import jmespath
 from parsel import Selector
@@ -85,108 +87,100 @@ def scrape_thread(url: str) -> dict:
         raise ValueError("could not find thread data in page")
 
 
-def scrape_search(query: str) -> dict:
-    """Scrape Threads search results for a given query"""
+def scrape_search(query: str, max_posts: Optional[int] = None, scroll_pause_s: float = 0.6, stable_rounds: int = 3) -> List[str]:
+    """Scrape Threads search results for a given query and return all post URLs.
+
+    Args:
+        query: search phrase
+        max_posts: optional hard cap on number of URLs; None = all found
+        scroll_pause_s: delay between scroll checks
+        stable_rounds: stop after this many rounds with no new URLs
+    """
+    search_url = f"https://www.threads.net/search?q={query}&serp_type=default"
+    urls: set[str] = set()
+    rounds_without_growth = 0
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         context = browser.new_context(viewport={"width": 1920, "height": 1080})
         page = context.new_page()
-        page.goto(f"https://www.threads.com/search?q={query}&serp_type=default")
+        page.goto(search_url)
         page.wait_for_selector("[data-pressable-container=true]")
-        selector = Selector(page.content())
 
-#####################################################################################################
+        last_height = 0
+        while True:
+            selector = Selector(page.content())
+            hidden = selector.css('script[type="application/json"][data-sjs]::text').getall()
+            for ds in hidden:
+                if '"ScheduledServerJS"' not in ds or "thread_items" not in ds:
+                    continue
+                try:
+                    data = json.loads(ds)
+                except Exception:
+                    continue
+                for items in nested_lookup("thread_items", data):
+                    for thread in items:
+                        try:
+                            t = parse_thread(thread)
+                            url = t.get("url")
+                            if url:
+                                urls.add(url)
+                                if max_posts and len(urls) >= max_posts:
+                                    return list(urls)
+                        except Exception:
+                            continue
 
-# def detect_lang(text: str) -> str:
-#     """Heuristic language detection for 'kaz', 'rus', or 'mixed'."""
-#     if not text:
-#         return "rus"
-#     t = text.lower()
-#     kaz_letters = set("әғқңөұүһі")
-#     has_cyr = any("\u0400" <= ch <= "\u04FF" for ch in t)
-#     has_kaz = any(ch in kaz_letters for ch in t)
-#     has_latin = any("a" <= ch <= "z" for ch in t)
-#     if has_kaz and has_cyr and has_latin:
-#         return "mixed"
-#     if has_kaz and has_cyr:
-#         return "kaz"
-#     if has_cyr:
-#         return "rus"
-#     return "rus"
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                break
+            time.sleep(scroll_pause_s)
+            try:
+                new_height = page.evaluate("document.body.scrollHeight")
+            except Exception:
+                break
+            if new_height == last_height:
+                rounds_without_growth += 1
+            else:
+                rounds_without_growth = 0
+                last_height = new_height
+            if rounds_without_growth >= stable_rounds:
+                break
 
-
-# def parse_search_features(keyword: str) -> list:
-#     """Parse Threads search results and return desired fields per item.
-
-#     Fields: nickname, text, likes, repost, comments, lang, label
-#     """
-#     url = f"https://www.threads.com/search?q={keyword}&serp_type=default"
-#     results = []
-#     with sync_playwright() as pw:
-#         browser = pw.chromium.launch()
-#         context = browser.new_context(viewport={"width": 1920, "height": 1080})
-#         page = context.new_page()
-#         page.goto(url)
-#         page.wait_for_selector("[data-pressable-container=true]")
-#         selector = Selector(page.content())
-#         hidden = selector.css('script[type="application/json"][data-sjs]::text').getall()
-#         for ds in hidden:
-#             if '"ScheduledServerJS"' not in ds or "thread_items" not in ds:
-#                 continue
-#             data = json.loads(ds)
-#             thread_items = nested_lookup("thread_items", data)
-#             if not thread_items:
-#                 continue
-#             threads = [parse_thread(t) for thread in thread_items for t in thread]
-#             for th in threads:
-#                 text = (th.get("text") or "").strip()
-#                 likes = th.get("like_count") or 0
-#                 comments = th.get("reply_count") or 0
-#                 try:
-#                     likes = int(likes)
-#                 except Exception:
-#                     m = re.search(r"\d+", str(likes))
-#                     likes = int(m.group(0)) if m else 0
-#                 try:
-#                     comments = int(comments)
-#                 except Exception:
-#                     m = re.search(r"\d+", str(comments))
-#                     comments = int(m.group(0)) if m else 0
-#                 results.append(
-#                     {
-#                         "nickname": th.get("username", ""),
-#                         "text": text,
-#                         "likes": likes,
-#                         "repost": 0,
-#                         "comments": comments,
-#                         "lang": detect_lang(text),
-#                         "label": keyword,
-#                     }
-#                 )
-#     return results
-
-# def save_results_json(path: str, rows: list) -> None:
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(rows, f, ensure_ascii=False, indent=2)
+    return list(urls)
 
 
-# def save_results_csv(path: str, rows: list) -> None:
-#     import csv
+def scrape_query_with_replies(query: str, max_posts: Optional[int] = None, per_post_delay_s: float = 0.25) -> List[Dict]:
+    """For a search query, collect all posts and fetch each full thread with replies.
 
-#     fieldnames = [
-#         "nickname",
-#         "text",
-#         "likes",
-#         "repost",
-#         "comments",
-#         "lang",
-#         "label",
-#     ]
-#     with open(path, "w", encoding="utf-8", newline="") as f:
-#         writer = csv.DictWriter(f, fieldnames=fieldnames)
-#         writer.writeheader()
-#         for r in rows:
-#             writer.writerow({k: r.get(k) for k in fieldnames})
+    Returns a list of objects: { url, thread, replies }.
+    """
+    urls = scrape_search(query, max_posts=max_posts)
+    results: List[Dict] = []
+    for url in urls:
+        try:
+            data = scrape_thread(url)
+            results.append({"url": url, **data})
+        except Exception:
+            continue
+        if per_post_delay_s:
+            time.sleep(per_post_delay_s)
+    return results
+
+
 
 if __name__ == "__main__":
-    print(scrape_thread("https://www.threads.com/search?q=sad&serp_type=default"))
+    parser = argparse.ArgumentParser(description="Threads query scraper (posts + replies)")
+    parser.add_argument("--query", required=True, help="Search query string")
+    parser.add_argument("--max-posts", type=int, default=None, help="Optional cap on number of posts to fetch")
+    parser.add_argument("--out", default="data/output.json", help="Output JSON path")
+    args = parser.parse_args()
+
+    data = scrape_query_with_replies(args.query, max_posts=args.max_posts)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"Saved {len(data)} threads to {args.out}")
+
+
+
+# https://www.threads.net/search?q=sad&serp_type=default
