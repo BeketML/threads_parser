@@ -6,3 +6,9 @@ jmespath>=1.0.1
 parsel>=1.9.1
 nested-lookup>=0.2.25
 playwright>=1.49.0
+selenium
+webdriver-manager
+jmespath
+parsel
+nested-lookup
+playwright
